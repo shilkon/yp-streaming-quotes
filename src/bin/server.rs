@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 use std::io::{BufRead, BufReader, Read};
@@ -16,23 +16,24 @@ fn main() -> std::io::Result<()> {
     
     // TODO: use CTRL + C to safely exit app and threads
 
-    // TODO: start UDP listener thread for PING
-
     let tickers_file = File::open("tickers.txt")?;
-    let generator_server = server.clone();
-    let generator_handle = thread::spawn(move || {
-        let mut quotes: Vec<StockQuote> = BufReader::new(tickers_file)
+    let quotes: Vec<StockQuote> = BufReader::new(tickers_file)
             .lines()
             .map(|line| StockQuote::new(line.unwrap().trim()))
             .collect();
-        while generator_server.is_active() {
-            quotes.iter_mut().for_each(|q| q.update());
-            let shared_quotes = Arc::new(quotes.clone()); 
-            let mut clients_guard = generator_server.clients_quard().unwrap();
-            clients_guard.retain(|s| {
-                s.send(Arc::clone(&shared_quotes)).is_ok()
-            });
-        }
+    let generator_server = server.clone();
+    let generator_handle = thread::spawn(move || {
+        generator_server.generate_qoutes(quotes);
+    });
+
+    let server_ping = Arc::clone(&server);
+    thread::spawn(move || {
+        server_ping.ping();
+    });
+
+    let server_keep_alive = Arc::clone(&server);
+    thread::spawn(move || {
+        server_keep_alive.keep_alive();
     });
 
     for stream in listener.incoming() {
@@ -43,7 +44,7 @@ fn main() -> std::io::Result<()> {
                     Ok(n) if n > 0 => {
                         let mut parts = cmd.split_whitespace();
                         if let Some("STREAM") = parts.next() {
-                            let address = parts.next().map(|s| s.to_string());
+                            let address = parts.next().map(|s| s.parse::<SocketAddr>().unwrap());
                             let tickets = parts.next().map(|s| {
                                 s.split(',').map(String::from).collect::<HashSet<String>>()
                             });

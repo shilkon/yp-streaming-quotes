@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender, Receiver};
+use std::sync::mpsc::{self, Sender};
 use std::net::{SocketAddr, UdpSocket};
 use std::{io, thread};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,6 +36,11 @@ pub struct QuotesServer {
 }
 
 impl QuotesServer {
+    const GENERATOR_TIMEOUT: u64 = 1;
+    const CLIENT_TIMEOUT: u64 = 5;
+    const KEEP_ALIVE_TIMEOUT: u64 = 5;
+    pub const UDP_MESSAGE_BUFFER_SIZE: usize = 1024;
+
     pub fn new(server_address: &str) -> io::Result<QuotesServer> {
         Ok(QuotesServer {
             is_active: AtomicBool::new(true),
@@ -55,67 +60,89 @@ impl QuotesServer {
             let clients_guard = self.clients.read().unwrap();
             clients_guard.iter().for_each(|(_, client)| {
                 if let Err(e) = client.sender.send(Arc::clone(&shared_quotes)) {
-                    eprintln!("Unable to send generated data to client's channel")
+                    log::error!("Error while sending generated data to client's channel: {e}")
                 }
             });
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_secs(Self::GENERATOR_TIMEOUT));
         }
+
+        log::info!("Quotes generation ended");
     }
 
-    pub fn stream_quotes(&self, address: SocketAddr, tickets: HashSet<String>) { //return Result
+    pub fn stream_quotes(&self, address: SocketAddr, tickers: HashSet<String>) { //return Result
+        log::info!("Starting streaming quotes for '{}' with tickers: {}", address,
+            tickers.iter().map(|s| s.as_str()).collect::<Vec<&str>>().join(", "));
+
         let (quotes_tx, quotes_rx) = mpsc::channel();
         {
             let mut clients = self.clients.write().unwrap();
             clients.insert(address, QuotesClient::new(quotes_tx));
         }
+
         while let Ok(quotes) = quotes_rx.recv() && self.is_active() {
-            let filtered: Vec<&StockQuote> = quotes.iter().filter(|q| tickets.contains(&q.ticker)).collect();
+            let filtered: Vec<&StockQuote> = quotes.iter().filter(|q| tickers.contains(&q.ticker)).collect();
             if !filtered.is_empty() {
                 let encoded = postcard::to_stdvec(&filtered).unwrap();
-                if !self.socket.send_to(&encoded, address).is_ok() {
-                    break;
+                match self.socket.send_to(&encoded, address) {
+                    Ok(_) => log::info!("Sended data to '{address}'"),
+                    Err(e) => log::warn!("Error while sending data to '{address}': {e}")
                 }
             }
         }
+
+        log::info!("Streaming quotes for '{address}' ended");
     }
 
     pub fn ping(&self) {
-        let mut buf = [0u8; 1024];
+        let mut buf = [0u8; Self::UDP_MESSAGE_BUFFER_SIZE];
         while self.is_active() {
             match self.socket.recv_from(&mut buf) {
                 Ok((amt, address)) => {
-                    if String::from_utf8_lossy(&buf[..amt]).trim() == "Ping" {
-                        let clients = self.clients.read().unwrap();
-                        if let Some(client) = clients.get(&address) {
-                            client.timestamp.store(QuotesClient::now(), Ordering::Relaxed);
+                    match String::from_utf8_lossy(&buf[..amt]).trim() {
+                        "Ping" => {
+                            let clients = self.clients.read().unwrap();
+                            if let Some(client) = clients.get(&address) {
+                                client.timestamp.store(QuotesClient::now(), Ordering::Relaxed);
+                            } else {
+                                log::warn!("Unknown client '{address}'");
+                            }
                         }
+                        s => log::warn!("Unsupported command '{s}' instead of 'Ping'")
                     }
                 },
-                Err(_) => todo!(),
+                Err(e) => log::warn!("Didn't recieve ping request: {e}"),
             }
         }
+
+        log::info!("Ping request processing ended");
     }
 
     pub fn keep_alive(&self) {
         while self.is_active() {
-            let mut inactive_addresses = Vec::new();
+            let mut addresses = Vec::new();
             let now = QuotesClient::now();
 
             let clients = self.clients.read().unwrap();
             clients.iter().for_each(|(address, client)| {
-                if now - client.timestamp.load(Ordering::Relaxed) > 5 {
-                    inactive_addresses.push(address);
+                if now - client.timestamp.load(Ordering::Relaxed) > Self::CLIENT_TIMEOUT {
+                    log::warn!("Connection timed out for '{address}'");
+                    addresses.push(address);
                 }
             });
 
-            if !inactive_addresses.is_empty() {
+            if !addresses.is_empty() {
+                let inactive_addresses: Vec<SocketAddr> = addresses.into_iter().copied().collect();
+                drop(clients);
+
                 let mut clients = self.clients.write().unwrap();
                 for address in inactive_addresses {
-                    clients.remove(address);
+                    clients.remove(&address);
                 }
             }
 
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_secs(Self::KEEP_ALIVE_TIMEOUT));
         }
+
+        log::info!("Keeping alive clients ended");
     }
 }

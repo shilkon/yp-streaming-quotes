@@ -40,3 +40,10 @@ impl StockQuote {
         self.timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
     }
 }
+
+impl std::fmt::Display for StockQuote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Ticker: '{}', Price: '{}', Volume: '{}', Timestamp: '{}'",
+            self.ticker, self.price, self.volume, self.timestamp)
+    }
+}
